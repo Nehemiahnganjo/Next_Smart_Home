@@ -1,0 +1,39 @@
+# Firmware secrets — never commit real credentials
+firmware/secrets.h
+firmware/esp32_controller/secrets.h
+
+# Arduino build output
+firmware/**/*.bin
+firmware/**/*.elf
+firmware/**/*.hex
+build/
+
+# Laravel
+laravel/.env
+laravel/vendor/
+laravel/node_modules/
+laravel/storage/logs/
+laravel/storage/framework/cache/
+laravel/storage/framework/sessions/
+laravel/storage/framework/views/
+laravel/bootstrap/cache/
+laravel/*.lock
+laravel/public/hot
+laravel/public/storage
+
+# Android
+android/**/*.apk
+android/**/*.aab
+android/**/.gradle/
+android/**/build/
+android/**/*.keystore
+android/**/*.jks
+android/**/local.properties
+android/**/.idea/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
