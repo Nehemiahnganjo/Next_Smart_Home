@@ -1,81 +1,210 @@
-# ESP32 ↔ Laravel ↔ Android — Full Control Stack
+# Next Smart Home
 
-## Architecture
+Control your home remotely from your phone. Flip a relay, dim a light, read a sensor — the tap on your screen reaches the ESP32 in under a second from anywhere in the world.
+
+Built by **Nehemiah Ng'anjo** for **Nextlinkmw**, Mzuzu, Malawi.
+
+---
+
+## What it is
+
+Three things working together:
+
+- An **ESP32** sits in your home, wired to whatever you want to control — relay boards, PWM motors, analog sensors. It dials out to an MQTT broker over TLS and waits for commands.
+- A **Laravel server** sits in the middle. Your phone talks to it over REST and WebSockets. It bridges commands to the ESP32 via MQTT and pushes real-time status updates back.
+- An **Android app** is what you actually use. Tap a switch, slide a PWM bar, watch the sensor readings update live.
+
+The architecture solves a real problem: ESP32s behind home NAT can't accept inbound connections. The server is the only thing that's publicly reachable — everything else connects out to it.
+
 ```
-Android App --REST(Sanctum)--> Laravel API --MQTT publish--> Broker --> ESP32
-Android App <--WebSocket(Reverb)-- Laravel <--MQTT subscribe-- Broker <-- ESP32
-```
-
-ESP32 sits behind mobile-network NAT, so it can never accept inbound
-connections — it always dials out to the MQTT broker. Laravel is the only
-thing the Android app talks to directly; Laravel bridges to MQTT.
-
-## Contents
-- `laravel/` — migrations, models, API controller, MQTT bridge (`mqtt:listen`), Reverb event, and now a session-authenticated browser dashboard (`resources/views/dashboard.blade.php`) alongside the Android API. See `laravel/SETUP.md`.
-- `firmware/esp32_controller.ino` — Arduino sketch: multi-pin digital/PWM/analog control over MQTT+TLS, LWT for online/offline detection, JSON command protocol.
-- `android/kotlin/` — Retrofit API client, Reverb (Pusher-protocol) live listener, example usage.
-- `android/kotlin/dashboard/` — Compose home-automation dashboard: `DashboardViewModel` (device list, live pin state, optimistic-pending tracking) + `DashboardScreen` (device cards, relay switches, PWM sliders, sensor readouts, live connection badge).
-
-## Command protocol (MQTT JSON)
-**Laravel → ESP32** on `devices/{device_uid}/cmd`:
-```json
-{"cmd_id": "uuid", "action": "digital_write", "pin": 26, "value": "1"}
-```
-Actions: `digital_write`, `pwm_write`, `analog_read`, `digital_read`, `get_status`
-
-**ESP32 → Laravel** on `devices/{device_uid}/status`:
-```json
-{
-  "device_uid": "esp32-a1b2c3",
-  "online": true,
-  "cmd_id": "uuid",
-  "result": "ok",
-  "pins": [{"pin": 26, "type": "digital_output", "label": "relay1", "value": 1}]
-}
+Android  ──REST (Sanctum)──►  Laravel  ──MQTT publish──►  Broker  ──►  ESP32
+Android  ◄──WebSocket (Reverb)──  Laravel  ◄──MQTT subscribe──  Broker  ◄──  ESP32
 ```
 
-## Setup order
-1. Stand up an MQTT broker with TLS (Mosquitto self-hosted or HiveMQ Cloud free tier). Create per-device ACL users so device A can't touch device B's topics.
-2. `laravel/SETUP.md` — install packages, migrate, run `mqtt:listen` + `reverb:start`.
-3. `firmware/secrets.example.h` → copy to `firmware/secrets.h`, fill in WiFi/broker/device credentials (gitignored, never committed). Flash `firmware/esp32_controller.ino`.
-4. Register the device via `POST /api/devices` (returns the device secret used for MQTT ACL provisioning).
-5. Wire the Android snippets into your app: Retrofit for commands, Reverb listener for live acks, `dashboard/` for the actual control UI.
+---
 
-## Firmware hardening (esp32_controller.ino)
-- **Fail-safe boot**: every output pin defaults LOW on startup — a reboot never leaves a relay in an unknown state.
-- **GPIO sanity checks at boot**: refuses to run if a `digital_output`/`pwm` pin is one of the input-only ADC pins (34–39); warns on strapping pins (0, 2, 12, 15) that can affect boot if something external holds them.
-- **Strict value parsing**: commands use `strtol` with error checking instead of `atoi`, which silently returns 0 on garbage — previously a malformed `value` could quietly turn a relay off instead of erroring.
-- **Actuation rate limiting**: 250ms minimum between writes to the same output pin, so a buggy client or a replayed command can't chatter a relay or gate motor.
-- **Duplicate-command guard**: MQTT QoS 1 can redeliver a message; the last executed `cmd_id` is tracked so a duplicate doesn't re-fire.
-- **Payload size guard**: command payloads over 256 bytes are rejected before parsing.
-- **Watchdog-safe delays**: all blocking waits (WiFi/MQTT backoff) are chunked so they can't outrun the hardware watchdog and cause a mid-retry reboot.
-- **Self-healing restart**: if MQTT stays unreachable for 10 minutes straight, the device restarts outright rather than looping in potentially corrupted TLS/socket state forever.
-- **Secrets out of source**: WiFi/MQTT/CA cert live in a gitignored `secrets.h`, not the sketch itself.
+## What you can control
 
-Not yet covered, worth adding for a more permanent deployment: OTA updates (so reflashing doesn't need physical access), NVS flash encryption for stored credentials (currently cleartext on the flash chip — fine unless someone has physical access to desolder/read it), and captive-portal WiFi provisioning instead of a hardcoded SSID/password.
+Each ESP32 declares its own pin layout in the firmware — the protocol is generic, so the same code handles all of these:
 
-## Laravel hardening
-- **Fixed a real leak**: `Device` had no `$hidden`, so every device list/register response was serializing `secret_hash` (the bcrypt hash of the MQTT provisioning secret) straight into the JSON the Android app received. Hidden now, along with the redundant `user_id`.
-- **MQTT publish failures no longer 500**: if the broker is unreachable when a command is sent, the command is marked `failed` and the API returns a clean 503 instead of an unhandled exception — previously a broker blip would crash the request and leave the command stuck `pending` forever.
-- **Per-action value validation**: `digital_write` now requires literally `"0"`/`"1"`, `pwm_write` requires 0–255, checked server-side before anything reaches MQTT — catches a bad request instantly with a 422 instead of burning a rate-limited command slot on something the firmware would've rejected anyway.
-- **`mqtt:listen` survives a broker drop**: previously a lost connection killed the whole persistent process and depended entirely on the process supervisor noticing and restarting it. Now it reconnects in-process with backoff. A bad/malformed message from one device is also isolated per-message so it can't take down status processing for every other device.
+| Type | Example use | Command |
+|---|---|---|
+| `digital_output` | Relay, LED, gate | `digital_write` with `"0"` or `"1"` |
+| `pwm` | Motor speed, dimmable light | `pwm_write` with `0`–`255` |
+| `analog_input` | Soil moisture, temperature | `analog_read` |
+| `digital_input` | Door sensor, button | `digital_read` |
 
-## Making it feel fast
-Three separate latency sources, fixed independently:
-- **ESP32 → broker**: WiFi power-save disabled (`WiFi.setSleep(false)`) — default modem sleep adds 100-300ms of jitter to every packet, felt as lag between tapping a switch and the relay clicking. Static IP option skips DHCP negotiation (1-3s) on boot/reconnect. Persistent MQTT session (`cleanSession=false`) avoids a resubscribe round-trip after reconnecting.
-- **Laravel → API**: `SETUP.md` §9 covers Laravel Octane, which keeps the framework booted in memory instead of re-bootstrapping it on every request. §10 covers optionally putting Cloudflare in front of the domain if the VPS is far from Rumphi — terminates TLS at a nearby edge PoP instead of the origin, which is most of the actual win; skip it if the VPS is already regionally close.
-- **Android UI**: switches and sliders now update optimistically the instant you tap them (`DashboardViewModel.optimisticValues`), reconciling with the real device state once the ack arrives over Reverb, and reverting if the command errors or times out (now 8s instead of 15s, since a revert needs to feel prompt too). OkHttp reuses a warm HTTP/2 connection instead of renegotiating TLS on every request.
+Adding a pin is one line in the firmware's `PINS[]` array and one entry in Laravel's `pin_config` — no protocol changes, no re-flashing other devices.
 
-TLS session resumption (§11 in SETUP.md) turned out to be a dead end on the ESP32 side — the Arduino core's `WiFiClientSecure` doesn't expose an API for it, so that one stays broker-config-only rather than an actual round-trip savings on the device.
+---
 
-## Extending pin control
-Add entries to the `PINS[]` array in the firmware and to a device's `pin_config`
-in Laravel — no protocol changes needed, the JSON schema is generic across
-digital/PWM/analog pins.
+## Repository layout
+
+```
+Next_Smart_Home/
+├── firmware/
+│   ├── esp32_controller/
+│   │   └── esp32_controller.ino    Main Arduino sketch
+│   ├── secrets.example.h           Copy → secrets.h, fill in credentials, never commit
+│   └── .gitignore                  Keeps secrets.h out of git
+│
+├── laravel/
+│   ├── app/
+│   │   ├── Http/Controllers/Api/   DeviceController — list, register, command
+│   │   ├── Http/Controllers/Web/   Browser dashboard (login + control panel)
+│   │   ├── Models/                 Device, DeviceCommand, DevicePinState
+│   │   ├── Events/                 DeviceStatusUpdated (Reverb broadcast)
+│   │   ├── Jobs/                   CheckCommandTimeout, CheckStaleDevices
+│   │   ├── Console/Commands/       mqtt:listen (persistent MQTT bridge)
+│   │   └── Policies/               DevicePolicy (users can only control their own)
+│   ├── database/migrations/        devices, device_commands, device_pin_states
+│   ├── resources/views/            Blade dashboard + auth (no npm/Vite needed)
+│   ├── routes/
+│   │   ├── api.php                 Sanctum-guarded REST + broadcasting auth
+│   │   └── web.php                 Session-guarded browser dashboard
+│   └── SETUP.md                    Full step-by-step deployment guide
+│
+└── android/kotlin/
+    ├── ApiClient.kt                Retrofit + OkHttp setup (HTTP/2, connection pool)
+    ├── DeviceApi.kt                Retrofit interface for all endpoints
+    ├── ReverbListener.kt           WebSocket client for live device status
+    ├── DeviceControlExample.kt     Usage snippets
+    └── dashboard/
+        ├── DashboardViewModel.kt   State, commands, optimistic UI, realtime events
+        └── DashboardScreen.kt      Compose UI — device cards, toggles, PWM sliders
+```
+
+---
+
+## How a command works end to end
+
+1. You tap a relay switch in the Android app.
+2. The switch flips immediately in the UI — this is optimistic. The app doesn't wait for confirmation.
+3. A `POST /api/devices/{id}/command` goes to Laravel.
+4. Laravel validates the action and value (`digital_write` must be `"0"` or `"1"`), creates a `DeviceCommand` record, and publishes a JSON message to `devices/{uid}/cmd` on the MQTT broker.
+5. The ESP32 receives the message, executes it, and publishes a response to `devices/{uid}/status`.
+6. Laravel's `mqtt:listen` process picks up the status, updates the database, and broadcasts a `DeviceStatusUpdated` event over Reverb.
+7. The Android app receives the WebSocket event and reconciles the live state. If it matches the optimistic value — nothing visible happens, it was already right. If the command failed or timed out — the switch reverts.
+
+If the broker is unreachable at step 4, Laravel marks the command `failed` and returns a 503 immediately instead of hanging. The optimistic UI reverts on the first error response.
+
+---
+
+## Firmware
+
+The sketch lives in `firmware/esp32_controller/esp32_controller.ino`. A few things worth knowing before you flash it:
+
+**Credentials never go in the sketch.** Copy `secrets.example.h` to `secrets.h` in the same folder, fill in your WiFi SSID, MQTT host, device UID, and broker CA certificate. `secrets.h` is gitignored — it never leaves your machine.
+
+**Pins are declared at the top of the sketch** in the `PINS[]` array. Add or remove entries there. The firmware checks at boot that you haven't accidentally mapped a command to an ADC-only pin (GPIO 34–39 on the ESP32 can't be outputs — the code refuses to run rather than silently doing nothing) and warns about strapping pins that can affect boot behaviour.
+
+**Every output defaults LOW at boot.** Before any command arrives, all relays are off. A board reset or power cut never leaves something in an unknown state.
+
+**The hardware watchdog is always running** (20-second timeout). If something in the loop hangs — a bad TLS state, a blocking call in future code — the board reboots rather than freezing indefinitely. Long delays are chunked so they don't accidentally trip it.
+
+**If the MQTT broker stays unreachable for 10 minutes straight**, the ESP32 restarts completely. A retry loop alone can't recover from certain corrupted TLS or socket states. A clean restart usually fixes it.
+
+**WiFi power-save is disabled.** Modem sleep adds 100–300 ms of jitter to every packet, which is felt directly as lag between a tap and a relay click. This device is mains-powered, so there's no reason to trade responsiveness for battery savings.
+
+---
+
+## Laravel
+
+The Laravel side is intentionally minimal — just the pieces this project needs, not a full application skeleton. See `laravel/SETUP.md` for the full deployment walk-through including packages, MQTT config, Reverb, Sanctum, a browser dashboard, and performance notes (Octane, HTTP/2, optional CDN).
+
+The important bits to know:
+
+**`mqtt:listen`** is a long-running artisan command, not a cron job. It maintains a persistent MQTT connection and processes status messages as they arrive. Run it under supervisor or systemd — if it exits, the Laravel→ESP32 link goes dark. It reconnects automatically on a broker drop rather than dying.
+
+**Commands that fail reach the client as a 503**, not a 500. If the broker is unreachable when a command is sent, Laravel marks it `failed` immediately and tells the Android app. The command isn't left `pending` forever.
+
+**Device policy** means users can only see and control their own devices. Accessing another user's device returns 403.
+
+**`secret_hash` is never serialised into API responses.** It used to be — it was missing from `$hidden` in the Device model. It's a bcrypt hash of the MQTT provisioning secret, meaningless to the app but something that shouldn't be sitting in every API response.
+
+**The browser dashboard** (`/dashboard`) is a Blade page that talks to the same `DeviceController` as the Android app. No npm or build step needed — Tailwind and Alpine.js load from CDN. Useful for quick access from a desktop without the Android app.
+
+---
+
+## Android
+
+The Android side is Kotlin + Jetpack Compose + Retrofit. The files in `android/kotlin/` are the integration layer — drop them into your project and wire them up.
+
+**`ApiClient`** sets up OkHttp with an HTTP/2 connection pool and a `Bearer` token interceptor. One warm connection handles bursts of commands without paying a TLS handshake on every tap.
+
+**`ReverbListener`** connects to the Reverb WebSocket using the Pusher protocol. It subscribes to `private-user.{id}.devices` and calls back your code whenever a device status event arrives.
+
+**`DashboardViewModel`** manages the full UI state — device list, live online/offline status, per-pin values, and the optimistic layer. When you send a command, the UI updates immediately and independently tracks whether the confirmation has come back. If the command errors or times out, the affected pin reverts visually instead of staying in the wrong state.
+
+**`DashboardScreen`** renders device cards with relay toggles, PWM sliders, sensor readouts, and a live connection badge. It reads entirely from the ViewModel state — no API calls from the UI layer.
+
+---
 
 ## Security checklist
-- [ ] MQTT over TLS (8883), broker CA pinned in firmware
-- [ ] Per-device MQTT credentials + ACLs (device can only pub/sub its own topics)
-- [ ] Sanctum tokens for Android API auth
-- [ ] Private Reverb channel scoped per user (`user.{id}.devices`)
-- [ ] Rate-limit `/api/devices/{id}/command` to prevent command flooding
+
+Before deploying:
+
+- [ ] MQTT over TLS (port 8883), broker CA certificate pinned in firmware
+- [ ] Per-device MQTT credentials — each ESP32 has its own username/password, scoped by broker ACL to only its own `devices/{uid}/` topics
+- [ ] Sanctum token authentication on all `/api/` routes
+- [ ] Private Reverb channel scoped per user (`private-user.{id}.devices`)
+- [ ] Rate-limit `/api/devices/{id}/command` at the nginx/middleware level
+- [ ] `secrets.h` never committed to git
+
+---
+
+## Quick start
+
+### 1. MQTT broker
+Set up a broker with TLS. Mosquitto on a VPS with a Let's Encrypt cert works fine. Create one user per device with ACL restricting it to `devices/{uid}/#`. Create a separate `laravel_bridge` user with access to `devices/#`.
+
+### 2. Laravel
+```bash
+cd laravel
+composer install
+cp .env.example .env   # fill in DB, MQTT, Reverb settings
+php artisan migrate
+php artisan mqtt:listen &   # persistent — use supervisor in production
+php artisan reverb:start &
+```
+
+### 3. Firmware
+```bash
+cp firmware/secrets.example.h firmware/esp32_controller/secrets.h
+# edit secrets.h — WiFi, MQTT host, device UID, CA cert
+# open esp32_controller.ino in Arduino IDE
+# edit PINS[] for your hardware
+# flash to your ESP32-WROOM-32
+```
+
+### 4. Register the device
+```bash
+curl -X POST https://your-server/api/devices \
+  -H "Authorization: Bearer YOUR_SANCTUM_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Living Room","device_uid":"esp32-a1b2c3","pin_config":[{"pin":26,"type":"digital_output","label":"relay1"}]}'
+```
+
+The response includes a one-time `device_secret` — use it as the MQTT password for that device.
+
+### 5. Android
+Point `ApiClient.create()` at your Laravel URL, set `authToken` after Sanctum login, and wire `ReverbListener` to your Reverb host. See `android/kotlin/DeviceControlExample.kt` for usage snippets.
+
+---
+
+## Requirements
+
+| Component | Requirement |
+|---|---|
+| ESP32 | WROOM-32 or any ESP32 with WiFi, Arduino core v3.x |
+| Laravel | PHP 8.2+, Laravel 11+, `php-mqtt/laravel-client`, `laravel/reverb`, `laravel/sanctum` |
+| Android | Kotlin, Jetpack Compose, Retrofit, OkHttp, Pusher-Java client |
+| MQTT broker | Any broker with TLS support (Mosquitto, HiveMQ, etc.) |
+
+---
+
+## License
+
+Proprietary. See [LICENSE](LICENSE).
+
+© 2026 Nextlinkmw. Built by Nehemiah Ng'anjo.
